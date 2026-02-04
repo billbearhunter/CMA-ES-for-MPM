@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-CMAEStest2-2.py (Corrected: Stronger Prior Check + Accurate Barrier + Batch Fallback)
+CMAEStest2-2.py (Final: GPU Batch + Fallback + Barrier + Clean Output + Wall Clock Timing)
 Joint Optimization on Setup 1 + 2.
 """
 
@@ -93,7 +93,7 @@ class ExpertBundle:
     log_idx: List[int]
     log_eps: float
 
-# --- Soft GMM Interpolation Functions ---
+# --- Soft GMM Interpolation ---
 def build_phi(y, W, H, eps=1e-8):
     y = np.asarray(y, dtype=float).reshape(1, -1)
     y_norm = y / (y[:, [-1]] + eps)
@@ -319,6 +319,9 @@ def run_cmaes_batch_timed(loss_fn_batch, bounds, x0=None, sigma0=0.5, popsize=16
 
 # --- Main ---
 def main():
+    # Record START time (Wall Clock)
+    wall_clock_start = time.time()
+
     parser = argparse.ArgumentParser()
     # Setup 2 Params
     parser.add_argument("-W1", type=float, required=True)
@@ -331,7 +334,7 @@ def main():
     parser.add_argument("-H3", type=float, default=0.0)
     parser.add_argument("-dis3", type=float, nargs=8, default=[])
     
-    # Path Linking (Crucial Change)
+    # Path Linking
     parser.add_argument("--setup1_dir", type=str, default=None, 
                         help="Path to the timestamped directory from Setup 1 containing setup1_best_x_n_eta_sigma.txt")
 
@@ -424,9 +427,8 @@ def main():
     scale_log_eta = math.log(MAX_ETA) - math.log(MIN_ETA)
     scale_log_sig = math.log(MAX_SIGMA_Y) - math.log(max(MIN_SIGMA_Y, 1e-6))
     LAMBDA_REG = 0.05
-    BARRIER_WT = 0.001 # Restored Value
+    BARRIER_WT = 0.001 
 
-    # --- Prepare Barrier Scales ---
     local_scale = {}
     for k in ["n", "eta", "sigma_y"]:
         local_scale[k] = bounds[k][1] - bounds[k][0]
@@ -434,14 +436,13 @@ def main():
             low = max(bounds[k][0], 1e-9)
             local_scale[f"log_{k}"] = math.log(bounds[k][1]) - math.log(low)
 
-    # --- BATCH LOSS FUNCTION WITH BARRIER ---
+    # --- BATCH LOSS FUNCTION ---
     def loss_setup2_batch(thetas):
         batch_size = len(thetas)
         losses = np.zeros(batch_size)
         valid_indices = []
         valid_params = []
         
-        # 1. CPU Feasibility Check
         for i, theta in enumerate(thetas):
             pen = 0.0
             for cfg in cfgs: pen += check_feasibility(theta, cfg["H"], cfg["W"])
@@ -452,37 +453,30 @@ def main():
         
         if not valid_indices: return losses.tolist()
 
-        # --- 2. Vectorized Prior & Barrier Calculation (CPU) ---
         v_thetas = np.array(valid_params)
         
-        # MAP Prior
+        # Prior & Barrier (CPU)
         d_n = ((v_thetas[:,0] - theta_0[0]) / scale_n)**2
         d_eta = ((np.log(v_thetas[:,1]) - math.log(theta_0[1])) / scale_log_eta)**2
-        # Ensure theta_0[2] is valid for log
         sig_0_safe = max(theta_0[2], 1e-9)
         d_sig = ((np.log(np.maximum(v_thetas[:,2], 1e-9)) - math.log(sig_0_safe)) / scale_log_sig)**2
         prior_loss = LAMBDA_REG * (d_n + d_eta + d_sig)
 
-        # Log Barrier (RESTORED!)
         epsilon = 1e-9
-        # n barrier
         val_n = (v_thetas[:,0] - bounds["n"][0]) / local_scale["n"]
         v_safe_n = np.clip(val_n, epsilon, 1.0 - epsilon)
         barrier = -np.log(v_safe_n) - np.log(1.0 - v_safe_n)
         
-        # eta barrier (log scale)
         val_eta = (np.log(v_thetas[:,1]) - math.log(max(bounds["eta"][0], 1e-9))) / local_scale["log_eta"]
         v_safe_eta = np.clip(val_eta, epsilon, 1.0 - epsilon)
         barrier += -np.log(v_safe_eta) - np.log(1.0 - v_safe_eta)
 
-        # sigma barrier (log scale)
         val_sig = (np.log(np.maximum(v_thetas[:,2], 1e-9)) - math.log(max(bounds["sigma_y"][0], 1e-9))) / local_scale["log_sigma_y"]
         v_safe_sig = np.clip(val_sig, epsilon, 1.0 - epsilon)
         barrier += -np.log(v_safe_sig) - np.log(1.0 - v_safe_sig)
 
         cpu_loss_part = prior_loss + (BARRIER_WT * barrier)
 
-        # --- 3. GPU Batch Prediction with FALLBACK ---
         try:
             total_nmse = np.zeros(len(valid_indices))
             for cfg_idx, cfg in enumerate(cfgs):
@@ -495,8 +489,7 @@ def main():
             final_loss = (total_nmse / len(cfgs)) + cpu_loss_part
             for idx, val in zip(valid_indices, final_loss): losses[idx] = val
 
-        except RuntimeError: # Batch Failed
-            # print("[Info] Batch failed, falling back to sequential...")
+        except RuntimeError: 
             for i, (idx, param) in enumerate(zip(valid_indices, valid_params)):
                 try:
                     single_nmse = 0.0
@@ -553,6 +546,14 @@ def main():
 
     except Exception as e:
         print(f"Optimization failed: {e}")
+
+    # --- TOTAL TIME RECORDING ---
+    wall_clock_end = time.time()
+    total_seconds = wall_clock_end - wall_clock_start
+    print(f"\n[Finished] Total Wall Clock Time: {total_seconds:.2f}s")
+    
+    with open(os.path.join(save_dir, "wall_clock_time.txt"), "w") as f:
+        f.write(f"{total_seconds:.4f}")
 
 if __name__ == "__main__":
     main()

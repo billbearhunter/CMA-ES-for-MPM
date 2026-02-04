@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-CMAEStest1-2.py (Final Fix: List Attribute Bug + Batch Fallback + GPU Accelerated)
-Setup 1 Optimization.
+CMAEStest1-2.py (Final: GPU Batch + Fallback + Wall Clock Timing)
+Records TOTAL execution time (including model loading).
 """
 
 import argparse
@@ -18,7 +18,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-# Set matplotlib backend to Agg
+# Set matplotlib backend
 plt.switch_backend('Agg')
 
 from dataclasses import dataclass
@@ -95,7 +95,7 @@ class ExpertBundle:
     log_idx: List[int]
     log_eps: float
 
-# --- Soft GMM Interpolation Functions ---
+# --- Soft GMM Interpolation ---
 def build_phi(y, W, H, eps=1e-8):
     y = np.asarray(y, dtype=float).reshape(1, -1)
     y_norm = y / (y[:, [-1]] + eps)
@@ -154,7 +154,6 @@ def get_adaptive_weights(gate_dict, phi, strategy="threshold", threshold=0.01,
         raise ValueError(f"Unknown strategy: {strategy}")
     
     expert_ids = [int(idx) + 1 for idx in expert_indices]
-    # 【修复】强制转换为 numpy 数组，避免 list 无法调用 .round() 的错误
     return expert_ids, np.array(weights, dtype=float)
 
 # --- ACCELERATED BATCH PREDICTION ---
@@ -204,7 +203,6 @@ def soft_predict_batch(theta_batch, expert_bundles, expert_ids, weights, W, H, d
     return weighted_pred
 
 def soft_predict(theta, expert_bundles, expert_ids, weights, W, H, device):
-    """Legacy single sample prediction for visualization"""
     n, eta, sigma_y = theta
     individual_preds = []
     valid_experts = []
@@ -213,9 +211,8 @@ def soft_predict(theta, expert_bundles, expert_ids, weights, W, H, device):
         if cid not in expert_bundles: continue
         bundle = expert_bundles[cid]
         try:
-            # Re-using batch prediction for single item to keep consistency
             pred = soft_predict_batch([[n, eta, sigma_y]], {cid: expert_bundles[cid]}, [cid], [1.0], W, H, device)
-            pred = pred.flatten() # (1, 8) -> (8,)
+            pred = pred.flatten()
             individual_preds.append((cid, pred, weight))
             valid_experts.append(cid)
             valid_weights.append(weight)
@@ -382,6 +379,9 @@ def create_comparison_visualization(theta, strategy_info, y_target, W, H, save_d
 
 # --- Main ---
 def main():
+    # Record WALL CLOCK START time (Includes args parsing, loading, optimization)
+    wall_clock_start = time.time()
+
     p = argparse.ArgumentParser()
     p.add_argument("-W1", type=float, required=True)
     p.add_argument("-H1", type=float, required=True)
@@ -402,7 +402,7 @@ def main():
 
     args = p.parse_args()
 
-    # --- Directory Setup (Only one dir) ---
+    # --- Directory Setup ---
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     strategy_str = f"{args.strategy}_{args.threshold}" if args.strategy != "topk" else f"topk_{args.topk}"
     save_dir = f"result_setup1_{strategy_str}_{timestamp}"
@@ -456,15 +456,13 @@ def main():
                 hi = min(bounds[k][1], float(box[k][1]))
                 if lo < hi: bounds[k] = (lo, hi)
     
-    # --- Batch Loss Function with Fallback ---
+    # --- Batch Loss with Fallback ---
     def loss_setup1_batch(thetas):
         batch_size = len(thetas)
         losses = np.zeros(batch_size)
-        
         valid_indices = []
         valid_params = []
         
-        # 1. CPU Feasibility
         for i, theta in enumerate(thetas):
             pen = check_feasibility(theta, height1, width1)
             if pen > 0.0: losses[i] = pen
@@ -474,30 +472,22 @@ def main():
         
         if not valid_indices: return losses.tolist()
 
-        # 2. GPU Batch Prediction with FALLBACK
         try:
-            # Try Fast Batch
             preds = soft_predict_batch(valid_params, expert_cache, expert_ids, weights, width1, height1, device)
             diff = preds - y1.reshape(1, -1)
             mse_vals = np.mean(diff**2, axis=1)
-            for idx, val in zip(valid_indices, mse_vals):
-                losses[idx] = val
-        
-        except RuntimeError: # Batch Failed (Singular Matrix, etc.)
-            # print(f"[Info] Batch failed, falling back to sequential...")
+            for idx, val in zip(valid_indices, mse_vals): losses[idx] = val
+        except RuntimeError:
             for idx, param in zip(valid_indices, valid_params):
                 try:
-                    # Sequential Fallback
                     pred_single = soft_predict_batch([param], expert_cache, expert_ids, weights, width1, height1, device)
                     diff = pred_single - y1.reshape(1, -1)
                     losses[idx] = np.mean(diff**2)
-                except Exception:
-                    losses[idx] = 1e6 # Penalize only the bad sample
+                except Exception: losses[idx] = 1e6
 
         return losses.tolist()
 
     print(f"\n--- Optimization Start (Popsize: {args.popsize}) ---")
-    start_t = time.time()
     
     theta_best, loss_best, hist = run_cmaes_batch(
         loss_setup1_batch, bounds, 
@@ -505,11 +495,10 @@ def main():
         maxiter=args.maxiter, seed=args.seed, verb_disp=args.verb
     )
     
-    print(f"Optimization Done in {time.time() - start_t:.2f}s")
     n_best, eta_best, sigma_best = theta_best
     print(f"Best Params: n={n_best:.6f}, eta={eta_best:.6f}, sigma_y={sigma_best:.6f}")
     
-    # Save results to save_dir ONLY
+    # Save History
     csv_path = os.path.join(save_dir, "best_loss_history.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -542,7 +531,6 @@ def main():
         setup2 = new_setups[1]
         print(f"W2 = {setup2.W:.3f}, H2 = {setup2.H:.3f}")
         
-        # Save to save_dir ONLY
         np.savetxt(os.path.join(save_dir, "setup1_best_x_n_eta_sigma.txt"), np.array([theta_best]))
         np.savetxt(os.path.join(save_dir, "setup1_recommended_setup2_WH.txt"), np.array([[setup2.W, setup2.H]]))
         print(f"Files saved to {save_dir}")
@@ -550,6 +538,14 @@ def main():
     except Exception as e:
         print(f"[Error] Mechanism search failed: {e}")
         np.savetxt(os.path.join(save_dir, "setup1_best_x_n_eta_sigma.txt"), np.array([theta_best]))
+
+    # --- TOTAL TIME RECORDING ---
+    wall_clock_end = time.time()
+    total_seconds = wall_clock_end - wall_clock_start
+    print(f"\n[Finished] Total Wall Clock Time: {total_seconds:.2f}s")
+    
+    with open(os.path.join(save_dir, "wall_clock_time.txt"), "w") as f:
+        f.write(f"{total_seconds:.4f}")
 
 if __name__ == "__main__":
     main()
