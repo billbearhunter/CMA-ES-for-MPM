@@ -33,14 +33,14 @@ python flowcurve.py --gt 9.588 0.7426 5.294 --est 0.9262699277877883 3.124745345
 python flowcurve.py --gt 9.588 0.7426 5.294 --est 5.544105275373647501e+00 8.264704734357762872e-01  2.987910694885393070e+01 --est 7.558369156283051282e+00 7.826257859075069767e-01 2.014506647073797296e+01 --out ./figs/new_chuno_soft.pdf
 python flowcurve.py --gt 9.588 0.7426 5.294 --est 5.544105275373647501e+00 8.264704734357762872e-01  2.987910694885393070e+01 --est 1.218714762718680333e+01 6.819524093189311964e-01  4.626502230838632990e+00 --out ./figs/new_chuno_soft2.pdf
 python CMAEStest1_2.py --strategy adaptive --confidence_threshold 0.9 --moe_dir moe_workspace5 -W1 3.8 -H1 2.7 -dis1 1.047015 2.9537308 4.3493195 5.097684 5.535777 5.8696012 6.1278687 6.3167524 -W2 2.6 -H2 2.0 -dis2 0.89187074 2.3503397 3.2547042 3.7178514 4.006258 4.1936007 4.33591 4.422762
-python CMAEStest2_2.py --setup1_dir "result_setup1_adaptive_0.01_20260204_102519" --strategy adaptive --confidence_threshold 0.9 --moe_dir moe_workspace5 -W1 3.8 -H1 2.7 -dis1 1.047015 2.9537308 4.3493195 5.097684 5.535777 5.8696012 6.1278687 6.3167524 -W2 2.6 -H2 2.0 -dis2 0.89187074 2.3503397 3.2547042 3.7178514 4.006258 4.1936007 4.33591 4.422762
+python CMAEStest2_2.py --setup1_dir "result_setup1_adaptive_0.01_20260204_112449" --strategy adaptive --confidence_threshold 0.9 --moe_dir moe_workspace5 -W1 3.8 -H1 2.7 -dis1 1.047015 2.9537308 4.3493195 5.097684 5.535777 5.8696012 6.1278687 6.3167524 -W2 2.6 -H2 2.0 -dis2 0.89187074 2.3503397 3.2547042 3.7178514 4.006258 4.1936007 4.33591 4.422762
 
 
 nvidia-smi
 
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate or .\venv\Scripts\Activate
 
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install gpytorch cma scikit-learn matplotlib joblib numpy
+pip install gpytorch cma scikit-learn matplotlib joblib numpy plotly pandas
 python -c "import torch; print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0)}')"

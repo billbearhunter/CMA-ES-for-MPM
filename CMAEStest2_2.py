@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-CMAEStest2-2.py (Final: GPU Batch + Fallback + Barrier + Clean Output + Wall Clock Timing)
-Joint Optimization on Setup 1 + 2.
+CMAEStest2-2.py (Final: GPU Batch + Fallback + Barrier + Clean Output + Wall Clock + Force Iterations)
 """
 
 import argparse
@@ -27,7 +26,6 @@ import torch
 import cma
 import joblib
 
-# --- Dependencies ---
 try:
     import sklearn
 except ImportError:
@@ -41,7 +39,6 @@ try:
     if "numpy._core" not in sys.modules: sys.modules["numpy._core"] = _np_core
 except: pass
 
-# Local Libs
 try:
     from libs.param import Param
     from libs.setup import Setup
@@ -57,14 +54,12 @@ except ImportError:
     class Mechanism:
         def searchNewSetup_orthognality_for_third_setup(self, m, s): return [None, None, Setup(s[-1].H, s[-1].W, 1.0)]
 
-# --- Config ---
 MIN_N, MAX_N = 0.3, 1.0
 MIN_ETA, MAX_ETA = 0.001, 300.0
 MIN_SIGMA_Y, MAX_SIGMA_Y = 0.0, 400.0
 GLOBAL_BOUNDS = {"n": (MIN_N, MAX_N), "eta": (MIN_ETA, MAX_ETA), "sigma_y": (MIN_SIGMA_Y, MAX_SIGMA_Y)}
 DTYPE = torch.float64
 
-# --- Models ---
 class _OfflineSVGPModel(gpytorch.models.ApproximateGP):
     def __init__(self, inducing_points):
         v = gpytorch.variational.VariationalStrategy(self, inducing_points, gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0)), learn_inducing_locations=True)
@@ -93,7 +88,6 @@ class ExpertBundle:
     log_idx: List[int]
     log_eps: float
 
-# --- Soft GMM Interpolation ---
 def build_phi(y, W, H, eps=1e-8):
     y = np.asarray(y, dtype=float).reshape(1, -1)
     y_norm = y / (y[:, [-1]] + eps)
@@ -154,7 +148,6 @@ def get_adaptive_weights(gate_dict, phi, strategy="threshold", threshold=0.01,
     expert_ids = [int(idx) + 1 for idx in expert_indices]
     return expert_ids, np.array(weights, dtype=float)
 
-# --- ACCELERATED BATCH PREDICTION ---
 def predict_expert_batch(bundle, n_batch, eta_batch, s_batch, W, H, device):
     batch_size = len(n_batch)
     if batch_size == 0: return np.array([])
@@ -200,7 +193,6 @@ def soft_predict_batch(theta_batch, expert_bundles, expert_ids, weights, W, H, d
     if valid_weights_sum > 0: weighted_pred /= valid_weights_sum
     return weighted_pred
 
-# --- Utils ---
 def _safe_torch_load(path, map_location):
     try: return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError: return torch.load(path, map_location=map_location)
@@ -291,14 +283,17 @@ def route_target_dis_topk(gate_dict, phi, topk=2):
     order = np.argsort(-probs)
     return [int(x) + 1 for x in order[:topk]], probs[order[:topk]]
 
-# --- ACCELERATED RUN LOOP WITH TIMING ---
-def run_cmaes_batch_timed(loss_fn_batch, bounds, x0=None, sigma0=0.5, popsize=16, maxiter=100, seed=42, verb_disp=1):
+def run_cmaes_batch_timed(loss_fn_batch, bounds, x0=None, sigma0=0.5, popsize=16, maxiter=700, seed=42, verb_disp=1):
     if x0 is None: x0 = default_x0(bounds)
     x0 = clamp_params(x0, bounds)
     opts = {
         "bounds": [[bounds[k][0] for k in ["n", "eta", "sigma_y"]], 
                   [bounds[k][1] for k in ["n", "eta", "sigma_y"]]],
-        "seed": seed, "popsize": popsize, "verbose": verb_disp, "maxiter": maxiter,
+        "seed": seed, "popsize": popsize, "verbose": verb_disp, 
+        "maxiter": maxiter,
+        "tolx": 1e-20,
+        "tolfun": 1e-20,
+        "tolstagnation": maxiter * 2
     }
     es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
     loss_history = []
@@ -317,50 +312,45 @@ def run_cmaes_batch_timed(loss_fn_batch, bounds, x0=None, sigma0=0.5, popsize=16
     res = es.result
     return [float(x) for x in res.xbest], float(res.fbest), loss_history, iter_times
 
-# --- Main ---
 def main():
-    # Record START time (Wall Clock)
     wall_clock_start = time.time()
-
-    parser = argparse.ArgumentParser()
-    # Setup 2 Params
-    parser.add_argument("-W1", type=float, required=True)
-    parser.add_argument("-H1", type=float, required=True)
-    parser.add_argument("-dis1", type=float, nargs=8, required=True)
-    parser.add_argument("-W2", type=float, required=True)
-    parser.add_argument("-H2", type=float, required=True)
-    parser.add_argument("-dis2", type=float, nargs=8, required=True)
-    parser.add_argument("-W3", type=float, default=0.0)
-    parser.add_argument("-H3", type=float, default=0.0)
-    parser.add_argument("-dis3", type=float, nargs=8, default=[])
+    p = argparse.ArgumentParser()
+    p.add_argument("-W1", type=float, required=True)
+    p.add_argument("-H1", type=float, required=True)
+    p.add_argument("-dis1", type=float, nargs=8, required=True)
+    p.add_argument("-W2", type=float, required=True)
+    p.add_argument("-H2", type=float, required=True)
+    p.add_argument("-dis2", type=float, nargs=8, required=True)
+    p.add_argument("-W3", type=float, default=0.0)
+    p.add_argument("-H3", type=float, default=0.0)
+    p.add_argument("-dis3", type=float, nargs=8, default=[])
     
-    # Path Linking
-    parser.add_argument("--setup1_dir", type=str, default=None, 
+    p.add_argument("--setup1_dir", type=str, default=None, 
                         help="Path to the timestamped directory from Setup 1 containing setup1_best_x_n_eta_sigma.txt")
 
-    parser.add_argument("--moe_dir", type=str, required=True)
-    parser.add_argument("--strategy", type=str, default="threshold", choices=["topk", "threshold", "adaptive", "all"])
-    parser.add_argument("--threshold", type=float, default=0.01)
-    parser.add_argument("--topk", type=int, default=1)
-    parser.add_argument("--confidence_threshold", type=float, default=0.7)
-    parser.add_argument("--max_experts", type=int, default=5)
-    parser.add_argument("--sigma0", type=float, default=0.5)
-    parser.add_argument("--popsize", type=int, default=16)
-    parser.add_argument("--maxiter", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--verb", type=int, default=1)
+    p.add_argument("--moe_dir", type=str, required=True)
+    p.add_argument("--strategy", type=str, default="threshold", choices=["topk", "threshold", "adaptive", "all"])
+    p.add_argument("--threshold", type=float, default=0.01)
+    p.add_argument("--topk", type=int, default=1)
+    p.add_argument("--confidence_threshold", type=float, default=0.7)
+    p.add_argument("--max_experts", type=int, default=5)
+    p.add_argument("--sigma0", type=float, default=0.5)
+    p.add_argument("--popsize", type=int, default=16)
+    p.add_argument("--maxiter", type=int, default=700)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--verb", type=int, default=1)
     
-    args = parser.parse_args()
+    args = p.parse_args()
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     strategy_str = f"{args.strategy}_{args.threshold}" if args.strategy != "topk" else f"topk_{args.topk}"
     save_dir = f"result_setup2_{strategy_str}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
+    print(f"\n[Info] Output directory created: {save_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"[Info] Using device: {device}")
 
-    # Configs
     cfgs = [
         {"id": 1, "W": args.W1, "H": args.H1, "y": np.array(args.dis1, float)},
         {"id": 2, "W": args.W2, "H": args.H2, "y": np.array(args.dis2, float)}
@@ -400,7 +390,6 @@ def main():
                                                 threshold=args.threshold, confidence_threshold=args.confidence_threshold, max_experts=args.max_experts)
         config_experts.append((ids, weights))
 
-    # --- Load Prior from Setup 1 ---
     bounds = GLOBAL_BOUNDS.copy()
     theta_0 = default_x0(bounds)
     
@@ -436,7 +425,6 @@ def main():
             low = max(bounds[k][0], 1e-9)
             local_scale[f"log_{k}"] = math.log(bounds[k][1]) - math.log(low)
 
-    # --- BATCH LOSS FUNCTION ---
     def loss_setup2_batch(thetas):
         batch_size = len(thetas)
         losses = np.zeros(batch_size)
@@ -455,7 +443,6 @@ def main():
 
         v_thetas = np.array(valid_params)
         
-        # Prior & Barrier (CPU)
         d_n = ((v_thetas[:,0] - theta_0[0]) / scale_n)**2
         d_eta = ((np.log(v_thetas[:,1]) - math.log(theta_0[1])) / scale_log_eta)**2
         sig_0_safe = max(theta_0[2], 1e-9)
@@ -518,7 +505,6 @@ def main():
         print(f"Optimization finished.")
         print(f"Best Params: {theta_best}")
         
-        # Save to new dir ONLY
         time_csv = os.path.join(save_dir, "iteration_times.csv")
         with open(time_csv, "w", newline="") as f:
             writer = csv.writer(f)
@@ -547,7 +533,6 @@ def main():
     except Exception as e:
         print(f"Optimization failed: {e}")
 
-    # --- TOTAL TIME RECORDING ---
     wall_clock_end = time.time()
     total_seconds = wall_clock_end - wall_clock_start
     print(f"\n[Finished] Total Wall Clock Time: {total_seconds:.2f}s")

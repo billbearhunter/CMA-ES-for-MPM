@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-CMAEStest1-2.py (Final: GPU Batch + Fallback + Wall Clock Timing)
-Records TOTAL execution time (including model loading).
+CMAEStest1-2.py (Final: GPU Batch + Fallback + Wall Clock + Force Iterations)
 """
 
 import argparse
@@ -18,7 +17,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-# Set matplotlib backend
 plt.switch_backend('Agg')
 
 from dataclasses import dataclass
@@ -28,7 +26,6 @@ import torch
 import cma
 import joblib
 
-# --- Dependencies ---
 try:
     import sklearn
 except ImportError as e:
@@ -42,7 +39,6 @@ try:
 except ImportError as e:
     raise RuntimeError("gpytorch is required.") from e
 
-# Local Libs
 try:
     from libs.param import Param
     from libs.setup import Setup
@@ -59,14 +55,12 @@ except ImportError:
         def searchNewSetup_orthognality_for_second_setup(self, m_breve, setups):
             return [None, Setup(setups[0].H, setups[0].W, 1.0)]
 
-# --- Config ---
 MIN_N, MAX_N = 0.3, 1.0
 MIN_ETA, MAX_ETA = 0.001, 300.0
 MIN_SIGMA_Y, MAX_SIGMA_Y = 0.0, 400.0
 GLOBAL_BOUNDS = {"n": (MIN_N, MAX_N), "eta": (MIN_ETA, MAX_ETA), "sigma_y": (MIN_SIGMA_Y, MAX_SIGMA_Y)}
 DTYPE = torch.float64
 
-# --- Models ---
 class _OfflineSVGPModel(gpytorch.models.ApproximateGP):
     def __init__(self, inducing_points):
         v = gpytorch.variational.VariationalStrategy(self, inducing_points, gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0)), learn_inducing_locations=True)
@@ -95,7 +89,6 @@ class ExpertBundle:
     log_idx: List[int]
     log_eps: float
 
-# --- Soft GMM Interpolation ---
 def build_phi(y, W, H, eps=1e-8):
     y = np.asarray(y, dtype=float).reshape(1, -1)
     y_norm = y / (y[:, [-1]] + eps)
@@ -156,7 +149,6 @@ def get_adaptive_weights(gate_dict, phi, strategy="threshold", threshold=0.01,
     expert_ids = [int(idx) + 1 for idx in expert_indices]
     return expert_ids, np.array(weights, dtype=float)
 
-# --- ACCELERATED BATCH PREDICTION ---
 def predict_expert_batch(bundle, n_batch, eta_batch, s_batch, W, H, device):
     batch_size = len(n_batch)
     if batch_size == 0: return np.array([])
@@ -224,7 +216,6 @@ def soft_predict(theta, expert_bundles, expert_ids, weights, W, H, device):
         weighted_pred += weight * pred
     return weighted_pred, individual_preds
 
-# --- Utils ---
 def _safe_torch_load(path, map_location):
     try: return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError: return torch.load(path, map_location=map_location)
@@ -318,13 +309,16 @@ def load_expert_bundle(path, device):
     log_idx = [i for i, c in enumerate(all_cols) if c in log_cols]
     return ExpertBundle(cid, models, likes, x_mean, x_scale, y_mean, y_scale, all_cols, log_idx, 1e-6)
 
-# --- Modified Run Loop ---
-def run_cmaes_batch(batch_loss_fn, bounds, x0=None, sigma0=0.5, popsize=16, maxiter=100, seed=42, verb_disp=1):
+def run_cmaes_batch(batch_loss_fn, bounds, x0=None, sigma0=0.5, popsize=16, maxiter=700, seed=42, verb_disp=1):
     if x0 is None: x0 = default_x0(bounds)
     x0 = clamp_params(x0, bounds)
     opts = {
         "bounds": [[bounds[k][0] for k in ["n","eta","sigma_y"]], [bounds[k][1] for k in ["n","eta","sigma_y"]]],
-        "seed": seed, "popsize": popsize, "verbose": verb_disp, "maxiter": maxiter,
+        "seed": seed, "popsize": popsize, "verbose": verb_disp, 
+        "maxiter": maxiter,
+        "tolx": 1e-20,
+        "tolfun": 1e-20,
+        "tolstagnation": maxiter * 2
     }
     es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
     loss_history = []
@@ -340,11 +334,9 @@ def run_cmaes_batch(batch_loss_fn, bounds, x0=None, sigma0=0.5, popsize=16, maxi
     res = es.result
     return [float(x) for x in res.xbest], float(res.fbest), loss_history
 
-# --- Visualization Function ---
 def create_comparison_visualization(theta, strategy_info, y_target, W, H, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    # 1. Weights
     ax1 = axes[0, 0]
     if 'hard' in strategy_info: strategy_info['hard']['weights'] = np.array(strategy_info['hard']['weights'])
     if 'soft' in strategy_info: strategy_info['soft']['weights'] = np.array(strategy_info['soft']['weights'])
@@ -358,14 +350,12 @@ def create_comparison_visualization(theta, strategy_info, y_target, W, H, save_d
         x_soft = np.arange(len(strategy_info['soft']['expert_ids']))
         ax1.bar(x_soft, strategy_info['soft']['weights'], width=0.4, label='Soft', alpha=0.7)
     ax1.set_title('Expert Weights')
-    # 2. Prediction
     ax2 = axes[0, 1]
     ax2.plot(y_target, 'ko-', label='Target')
     if 'hard' in strategy_info: ax2.plot(strategy_info['hard']['prediction'], 'bs--', label='Hard')
     if 'soft' in strategy_info: ax2.plot(strategy_info['soft']['prediction'], 'r^--', label='Soft')
     ax2.legend()
     ax2.set_title('Prediction')
-    # 3. Params
     ax3 = axes[0, 2]
     ax3.scatter(theta[0], theta[1], s=200, c='red', marker='*')
     ax3.set_title(f'Params: n={theta[0]:.2f}, eta={theta[1]:.2f}')
@@ -377,11 +367,8 @@ def create_comparison_visualization(theta, strategy_info, y_target, W, H, save_d
     plt.close()
     return save_path
 
-# --- Main ---
 def main():
-    # Record WALL CLOCK START time (Includes args parsing, loading, optimization)
     wall_clock_start = time.time()
-
     p = argparse.ArgumentParser()
     p.add_argument("-W1", type=float, required=True)
     p.add_argument("-H1", type=float, required=True)
@@ -396,13 +383,12 @@ def main():
     p.add_argument("--compare_strategies", action="store_true")
     p.add_argument("--sigma0", type=float, default=0.5)
     p.add_argument("--popsize", type=int, default=16)
-    p.add_argument("--maxiter", type=int, default=100)
+    p.add_argument("--maxiter", type=int, default=700)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--verb", type=int, default=1)
 
     args = p.parse_args()
 
-    # --- Directory Setup ---
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     strategy_str = f"{args.strategy}_{args.threshold}" if args.strategy != "topk" else f"topk_{args.topk}"
     save_dir = f"result_setup1_{strategy_str}_{timestamp}"
@@ -456,20 +442,17 @@ def main():
                 hi = min(bounds[k][1], float(box[k][1]))
                 if lo < hi: bounds[k] = (lo, hi)
     
-    # --- Batch Loss with Fallback ---
     def loss_setup1_batch(thetas):
         batch_size = len(thetas)
         losses = np.zeros(batch_size)
         valid_indices = []
         valid_params = []
-        
         for i, theta in enumerate(thetas):
             pen = check_feasibility(theta, height1, width1)
             if pen > 0.0: losses[i] = pen
             else:
                 valid_indices.append(i)
                 valid_params.append(theta)
-        
         if not valid_indices: return losses.tolist()
 
         try:
@@ -484,7 +467,6 @@ def main():
                     diff = pred_single - y1.reshape(1, -1)
                     losses[idx] = np.mean(diff**2)
                 except Exception: losses[idx] = 1e6
-
         return losses.tolist()
 
     print(f"\n--- Optimization Start (Popsize: {args.popsize}) ---")
@@ -498,7 +480,6 @@ def main():
     n_best, eta_best, sigma_best = theta_best
     print(f"Best Params: n={n_best:.6f}, eta={eta_best:.6f}, sigma_y={sigma_best:.6f}")
     
-    # Save History
     csv_path = os.path.join(save_dir, "best_loss_history.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -539,7 +520,6 @@ def main():
         print(f"[Error] Mechanism search failed: {e}")
         np.savetxt(os.path.join(save_dir, "setup1_best_x_n_eta_sigma.txt"), np.array([theta_best]))
 
-    # --- TOTAL TIME RECORDING ---
     wall_clock_end = time.time()
     total_seconds = wall_clock_end - wall_clock_start
     print(f"\n[Finished] Total Wall Clock Time: {total_seconds:.2f}s")
